@@ -1,0 +1,1 @@
+docker run --privileged --rm tonistiigi/binfmt:latest --install aarch64
