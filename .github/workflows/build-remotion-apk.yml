@@ -1,5 +1,15 @@
 name: Build Remotion APK
 
+# -----------------------------------------------------------------------------
+# OpenMinis (Android/PRoot) 改造为 Debian(glibc) rootfs 以支持 Remotion。
+# 全程在 GitHub 云端完成，你本机无需安装 Android 工具链。
+#
+# 抗限流：只保留体积最小、最不易被限流的 checkout/upload-artifact 两个 action，
+# 其余（JDK、Android SDK/NDK）全部内联安装。
+#
+# 跨架构：GitHub 构建机是 x86_64，而 rootfs 目标是 arm64。qemu-aarch64 binfmt
+# 的注册已在 prepare_debian_rootfs_android.sh 脚本内部完成（优先用 docker）。
+# -----------------------------------------------------------------------------
 on:
   workflow_dispatch:
   push:
@@ -9,23 +19,33 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # 1) 拉代码 + 递归拉子模块（deps/proot 是 proot 源码子模块，编译 proot 必须）
       - name: Checkout (含递归子模块)
         uses: actions/checkout@v4
         with:
           submodules: 'recursive'
-      - name: 安装 rootfs 构建依赖 (debootstrap, qemu, unzip)
+
+      # 2) 安装少量宿主机工具（rootfs 改用 docker export 方案，不再需要 debootstrap/qemu）
+      - name: 安装宿主机工具 (curl, unzip 等)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq debootstrap qemu-user-static binfmt-support ca-certificates curl xz-utils pigz make gcc unzip
-          sudo update-binfmts --enable qemu-aarch64 || true
+          sudo apt-get install -y -qq curl unzip xz-utils ca-certificates pigz || \
+          sudo apt-get install -y -qq curl unzip xz-utils ca-certificates gzip
+
+      # 3) 构建 Debian(glibc) rootfs -> debian-minirootfs.tar.gz，放进 assets
+      #    （脚本内部会自动注册 qemu-aarch64 binfmt 以便 x86 上 chroot arm64）
       - name: 构建 Debian(glibc) rootfs
         run: |
           sudo ./prepare_debian_rootfs_android.sh bookworm
           cp debian-minirootfs.tar.gz src/android/app/src/main/assets/
+
+      # 4) 使用 runner 自带的 JDK 17（避免下载第三方 action 触发 GitHub 限流 429）
       - name: 使用系统自带 JDK 17
         run: |
           echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
           java -version
+
+      # 5) 手动安装 Android SDK/NDK（用 curl 从 dl.google.com 直装，不依赖 setup-android action）
       - name: 安装 Android SDK/NDK (手动)
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -35,17 +55,28 @@ jobs:
           curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/cmdline.zip
           unzip -q /tmp/cmdline.zip -d "$SDK/cmdline-tools"
           mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
-          { echo "ANDROID_HOME=$SDK"; echo "ANDROID_SDK_ROOT=$SDK"; } >> "$GITHUB_ENV"
+          {
+            echo "ANDROID_HOME=$SDK"
+            echo "ANDROID_SDK_ROOT=$SDK"
+          } >> "$GITHUB_ENV"
           export PATH="$SDK/cmdline-tools/latest/bin:$PATH"
           yes | sdkmanager --licenses
-          sdkmanager --install "ndk;28.0.12433566" "build-tools;34.0.0" "platforms;android-34" "cmake;3.22.1" || sdkmanager --install "ndk;28.0.13004108" "build-tools;34.0.0" "platforms;android-34" "cmake;3.22.1"
+          sdkmanager --install "ndk;28.0.12433566" "build-tools;34.0.0" "platforms;android-34" "cmake;3.22.1" || \
+          sdkmanager --install "ndk;28.0.13004108" "build-tools;34.0.0" "platforms;android-34" "cmake;3.22.1"
           yes | sdkmanager --licenses
+          # 让 build_proot.sh 的 resolve_ndk() 能找到 NDK
           NDK=$(ls -d "$SDK"/ndk/* 2>/dev/null | sort -V | tail -1)
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+
+      # 6) 编译 proot-aarch64 + libproot.so 并自动装进 assets/jniLibs（关键！缺它沙箱起不来）
       - name: 编译 proot 二进制 (build_proot.sh)
         run: ./deps/build_proot.sh
+
+      # 7) 给两个 Kotlin 文件打补丁（Alpine→Debian + 绑 /dev/shm）。改不动会主动中止。
       - name: 打 Kotlin 补丁
         run: python3 apply_patches.py .
+
+      # 8) 写入 Debian 版 default_mount 覆盖层（内联，不依赖外部文件夹）
       - name: 写入 Debian 版 default_mount（内联）
         run: |
           DM=src/android/app/src/main/assets/default_mount
@@ -63,11 +94,15 @@ jobs:
           export PATH="/usr/local/bin:/opt/bin:$PATH"
           export CHROME_HEADLESS=1
           EOF
+
+      # 9) 编译 debug APK
       - name: 编译 debug APK
         working-directory: src/android
         run: |
           chmod +x ./gradlew
           ./gradlew assembleDebug --no-daemon
+
+      # 10) 上传产物
       - name: 上传 APK 产物
         uses: actions/upload-artifact@v4
         with:
