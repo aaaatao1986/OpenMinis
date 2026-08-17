@@ -1,0 +1,75 @@
+name: Build Remotion APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (含递归子模块)
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+      - name: 安装 rootfs 构建依赖 (debootstrap, qemu, unzip)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq debootstrap qemu-user-static binfmt-support ca-certificates curl xz-utils pigz make gcc unzip
+          sudo update-binfmts --enable qemu-aarch64 || true
+      - name: 构建 Debian(glibc) rootfs
+        run: |
+          sudo ./prepare_debian_rootfs_android.sh bookworm
+          cp debian-minirootfs.tar.gz src/android/app/src/main/assets/
+      - name: 使用系统自带 JDK 17
+        run: |
+          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+          java -version
+      - name: 安装 Android SDK/NDK (手动)
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          SDK="$HOME/android-sdk"
+          mkdir -p "$SDK/cmdline-tools"
+          curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/cmdline.zip
+          unzip -q /tmp/cmdline.zip -d "$SDK/cmdline-tools"
+          mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
+          { echo "ANDROID_HOME=$SDK"; echo "ANDROID_SDK_ROOT=$SDK"; } >> "$GITHUB_ENV"
+          export PATH="$SDK/cmdline-tools/latest/bin:$PATH"
+          yes | sdkmanager --licenses
+          sdkmanager --install "ndk;28.0.12433566" "build-tools;34.0.0" "platforms;android-34" "cmake;3.22.1" || sdkmanager --install "ndk;28.0.13004108" "build-tools;34.0.0" "platforms;android-34" "cmake;3.22.1"
+          yes | sdkmanager --licenses
+          NDK=$(ls -d "$SDK"/ndk/* 2>/dev/null | sort -V | tail -1)
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+      - name: 编译 proot 二进制 (build_proot.sh)
+        run: ./deps/build_proot.sh
+      - name: 打 Kotlin 补丁
+        run: python3 apply_patches.py .
+      - name: 写入 Debian 版 default_mount（内联）
+        run: |
+          DM=src/android/app/src/main/assets/default_mount
+          rm -rf "$DM"
+          mkdir -p "$DM/etc/apt" "$DM/etc/profile.d"
+          cat > "$DM/etc/apt/sources.list" <<'EOF'
+          deb http://deb.debian.org/debian bookworm main contrib non-free
+          deb http://deb.debian.org/debian-security bookworm-security main
+          EOF
+          cat > "$DM/etc/resolv.conf" <<'EOF'
+          nameserver 8.8.8.8
+          nameserver 1.1.1.1
+          EOF
+          cat > "$DM/etc/profile.d/minis.sh" <<'EOF'
+          export PATH="/usr/local/bin:/opt/bin:$PATH"
+          export CHROME_HEADLESS=1
+          EOF
+      - name: 编译 debug APK
+        working-directory: src/android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --no-daemon
+      - name: 上传 APK 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug.apk
+          path: src/android/app/build/outputs/apk/debug/app-debug.apk
