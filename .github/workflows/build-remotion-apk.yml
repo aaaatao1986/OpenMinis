@@ -1,14 +1,10 @@
 name: Build Remotion APK
 
 # -----------------------------------------------------------------------------
-# OpenMinis (Android/PRoot) 改造为 Debian(glibc) rootfs 以支持 Remotion。
-# 全程在 GitHub 云端完成，你本机无需安装 Android 工具链。
-#
-# 抗限流：只保留体积最小、最不易被限流的 checkout/upload-artifact 两个 action，
-# 其余（JDK、Android SDK/NDK）全部内联安装。
-#
-# 跨架构：GitHub 构建机是 x86_64，而 rootfs 目标是 arm64。qemu-aarch64 binfmt
-# 的注册已在 prepare_debian_rootfs_android.sh 脚本内部完成（优先用 docker）。
+# 完全自包含的 OpenMinis -> Debian(glibc) rootfs 构建流程。
+# 关键改动：prepare 脚本与打补丁的 python 不再依赖仓库里的外部文件，
+# 而是在 workflow 运行时用 heredoc 直接生成到 /tmp，避免“文件没放到根目录”之类问题。
+# 你只需要把这个 .github/workflows/build-remotion-apk.yml 提交到仓库即可。
 # -----------------------------------------------------------------------------
 on:
   workflow_dispatch:
@@ -19,33 +15,103 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      # 1) 拉代码 + 递归拉子模块（deps/proot 是 proot 源码子模块，编译 proot 必须）
       - name: Checkout (含递归子模块)
         uses: actions/checkout@v4
         with:
           submodules: 'recursive'
 
-      # 2) 安装少量宿主机工具（rootfs 改用 docker export 方案，不再需要 debootstrap/qemu）
       - name: 安装宿主机工具 (curl, unzip 等)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq curl unzip xz-utils ca-certificates pigz || \
           sudo apt-get install -y -qq curl unzip xz-utils ca-certificates gzip
 
-      # 3) 构建 Debian(glibc) rootfs -> debian-minirootfs.tar.gz，放进 assets
-      #    （脚本内部会自动注册 qemu-aarch64 binfmt 以便 x86 上 chroot arm64）
+      # ===== 构建 Debian(glibc) rootfs（脚本在运行时生成，不依赖外部文件）=====
       - name: 构建 Debian(glibc) rootfs
         run: |
-          sudo ./prepare_debian_rootfs_android.sh bookworm
+          cat > /tmp/prepare_debian_rootfs_android.sh <<'PREP_EOF'
+          #!/bin/bash
+          set -euo pipefail
+          trap 'echo "[ERROR] command failed at line $LINENO: $BASH_COMMAND" >&2' ERR
+
+          SUITE="${1:-bookworm}"
+          case "$SUITE" in
+            bookworm) DOCKER_IMG="debian:bookworm" ;;
+            bullseye) DOCKER_IMG="debian:bullseye" ;;
+            *)        DOCKER_IMG="debian:$SUITE" ;;
+          esac
+
+          OUT_TARBALL="debian-minirootfs.tar.gz"
+          OUT_DIR="$(pwd)"
+
+          log() { echo "[debian-rootfs] $*" ; }
+          err() { echo "[debian-rootfs] ERROR: $*" >&2 ; }
+
+          echo "===== DEBUG: docker version ====="
+          docker version 2>&1 | head -20 || true
+          echo "===== DEBUG: binfmt_misc entries ====="
+          ls -1 /proc/sys/fs/binfmt_misc/ 2>&1 | head -40 || true
+          echo "===== DEBUG: uname ====="
+          uname -m
+
+          if ! command -v docker >/dev/null 2>&1; then
+            err "Docker 不可用。GitHub ubuntu-latest 默认自带 docker。"
+            exit 1
+          fi
+
+          log "注册 qemu-aarch64 binfmt（让 docker 能运行 arm64 容器）..."
+          set +e
+          docker run --privileged --rm tonistiigi/binfmt:latest --install aarch64 2>&1 | tail -5
+          RC1=$?
+          docker run --privileged --rm multiarch/qemu-user-static --reset -p yes 2>&1 | tail -5
+          RC2=$?
+          set -e
+          if [ "${RC1:-1}" -ne 0 ] && [ "${RC2:-1}" -ne 0 ]; then
+            err "binfmt 注册失败（两个镜像都拉不到）。arm64 容器将无法运行。"
+            exit 1
+          fi
+          log "binfmt 注册完成。"
+
+          log "在 arm64 容器内安装 Node20 + Chromium 并打包 rootfs..."
+          docker run --rm --platform linux/arm64 \
+            -e SUITE="$SUITE" \
+            -v "$OUT_DIR:/out" \
+            "$DOCKER_IMG" bash -c '
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+            S="$SUITE"
+            echo "[PHASE] 写 apt 源 ($S)"
+            printf "deb http://deb.debian.org/debian %s main contrib non-free\ndeb http://deb.debian.org/debian %s-updates main contrib non-free\ndeb http://deb.debian.org/debian-security %s-security main\n" "$S" "$S" "$S" > /etc/apt/sources.list
+            echo openminis > /etc/hostname
+            printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf
+            echo "[PHASE] apt update"
+            apt-get update -qq
+            echo "[PHASE] 基础工具"
+            apt-get install -y -qq --no-install-recommends ca-certificates curl wget gnupg lsb-release xz-utils git python3 make g++ pkg-config
+            echo "[PHASE] Node.js 20"
+            curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+            apt-get install -y -qq --no-install-recommends nodejs
+            node --version
+            npm --version
+            echo "[PHASE] Chromium + 运行库"
+            apt-get install -y -qq --no-install-recommends chromium libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 libpango-1.0-0 libcairo2 libatspi2.0-0 fonts-liberation fonts-noto-core
+            chromium --version || true
+            echo "[PHASE] 清理 + 打包 rootfs"
+            rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* 2>/dev/null || true
+            tar -czf /out/debian-minirootfs.tar.gz --exclude=/out --exclude=/proc --exclude=/sys --exclude=/dev -C / .
+            echo "[PHASE] 完成: $(du -h /out/debian-minirootfs.tar.gz | cut -f1)"
+          '
+          log "rootfs 已生成: $OUT_DIR/$OUT_TARBALL"
+          PREP_EOF
+          chmod +x /tmp/prepare_debian_rootfs_android.sh
+          sudo /tmp/prepare_debian_rootfs_android.sh bookworm
           cp debian-minirootfs.tar.gz src/android/app/src/main/assets/
 
-      # 4) 使用 runner 自带的 JDK 17（避免下载第三方 action 触发 GitHub 限流 429）
       - name: 使用系统自带 JDK 17
         run: |
           echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
           java -version
 
-      # 5) 手动安装 Android SDK/NDK（用 curl 从 dl.google.com 直装，不依赖 setup-android action）
       - name: 安装 Android SDK/NDK (手动)
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -64,19 +130,103 @@ jobs:
           sdkmanager --install "ndk;28.0.12433566" "build-tools;34.0.0" "platforms;android-34" "cmake;3.22.1" || \
           sdkmanager --install "ndk;28.0.13004108" "build-tools;34.0.0" "platforms;android-34" "cmake;3.22.1"
           yes | sdkmanager --licenses
-          # 让 build_proot.sh 的 resolve_ndk() 能找到 NDK
           NDK=$(ls -d "$SDK"/ndk/* 2>/dev/null | sort -V | tail -1)
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
 
-      # 6) 编译 proot-aarch64 + libproot.so 并自动装进 assets/jniLibs（关键！缺它沙箱起不来）
       - name: 编译 proot 二进制 (build_proot.sh)
         run: ./deps/build_proot.sh
 
-      # 7) 给两个 Kotlin 文件打补丁（Alpine→Debian + 绑 /dev/shm）。改不动会主动中止。
+      # ===== 打 Kotlin 补丁（python 在运行时生成，不依赖外部文件）=====
       - name: 打 Kotlin 补丁
-        run: python3 apply_patches.py .
+        run: |
+          cat > /tmp/apply_patches.py <<'PY_EOF'
+          #!/usr/bin/env python3
+          import sys
+          import os
 
-      # 8) 写入 Debian 版 default_mount 覆盖层（内联，不依赖外部文件夹）
+          REPO = sys.argv[1] if len(sys.argv) > 1 else "."
+          SANDBOX = os.path.join(
+              REPO, "src/android/app/src/main/java/com/openminis/app/sandbox")
+
+          ROOTFS = os.path.join(SANDBOX, "RootfsManager.kt")
+          PROOT = os.path.join(SANDBOX, "PRootKernel.kt")
+
+
+          def replace_once(path, old, new, label):
+              if not os.path.isfile(path):
+                  print(f"  [SKIP] {path} not found")
+                  return False
+              with open(path, "r", encoding="utf-8") as f:
+                  text = f.read()
+              if old not in text:
+                  print(f"  [FAIL] pattern not found in {os.path.basename(path)}:\n"
+                        f"         {label}\n         -> aborting (file may have changed).")
+                  sys.exit(1)
+              if text.count(old) != 1:
+                  print(f"  [WARN] pattern matched {text.count(old)} times in "
+                        f"{os.path.basename(path)}; applying to first only.")
+              text = text.replace(old, new, 1)
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(text)
+              print(f"  [OK]   patched {os.path.basename(path)} - {label}")
+              return True
+
+
+          print("== OpenMinis: Alpine->Debian (glibc) patch for Remotion ==\n")
+
+          print("[1/2] RootfsManager.kt")
+          replace_once(
+              ROOTFS,
+              'val rootfsDir: File = File(context.filesDir, "alpine-rootfs")',
+              'val rootfsDir: File = File(context.filesDir, "debian-rootfs")',
+              'rootfsDir path: alpine-rootfs -> debian-rootfs')
+
+          replace_once(
+              ROOTFS,
+              'private const val ROOTFS_ASSET = "alpine-minirootfs.tar.gz"',
+              'private const val ROOTFS_ASSET = "debian-minirootfs.tar.gz"',
+              'ROOTFS_ASSET: debian-minirootfs.tar.gz')
+
+          replace_once(
+              ROOTFS,
+              'private const val ROOTFS_ASSET_TAR = "alpine-minirootfs.tar"',
+              'private const val ROOTFS_ASSET_TAR = "debian-minirootfs.tar"',
+              'ROOTFS_ASSET_TAR: debian-minirootfs.tar')
+
+          replace_once(
+              ROOTFS,
+              'Log.i(TAG, "Installing Alpine rootfs...")',
+              'Log.i(TAG, "Installing Debian rootfs...")',
+              'log string: Alpine -> Debian')
+
+          print("\n[2/2] PRootKernel.kt")
+          OLD_BIND = '''        // Bind essential pseudo-filesystems
+          cmd.add("-b")
+          cmd.add("/dev")
+          cmd.add("-b")
+          cmd.add("/proc")
+          cmd.add("-b")
+          cmd.add("/sys")'''
+
+          NEW_BIND = '''        // Bind essential pseudo-filesystems
+          cmd.add("-b")
+          cmd.add("/dev")
+          cmd.add("-b")
+          cmd.add("/proc")
+          cmd.add("-b")
+          cmd.add("/sys")
+
+          // Bind host /dev/shm so headless Chromium / Remotion has shared memory.
+          cmd.add("-b")
+          cmd.add("/dev/shm")'''
+
+          replace_once(PROOT, OLD_BIND, NEW_BIND,
+                       'add -b /dev/shm bind mount')
+
+          print("\n== Done. ==")
+          PY_EOF
+          python3 /tmp/apply_patches.py .
+
       - name: 写入 Debian 版 default_mount（内联）
         run: |
           DM=src/android/app/src/main/assets/default_mount
@@ -95,14 +245,12 @@ jobs:
           export CHROME_HEADLESS=1
           EOF
 
-      # 9) 编译 debug APK
       - name: 编译 debug APK
         working-directory: src/android
         run: |
           chmod +x ./gradlew
           ./gradlew assembleDebug --no-daemon
 
-      # 10) 上传产物
       - name: 上传 APK 产物
         uses: actions/upload-artifact@v4
         with:
