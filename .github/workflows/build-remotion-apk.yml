@@ -213,6 +213,18 @@ jobs:
           replace_once(PROOT, OLD_BIND, NEW_BIND,
                        'add -b /dev/shm bind mount')
 
+          print("\n[3/3] build.gradle.kts (noCompress 修复)")
+          # AGP 的 CompressAssetsWorkAction 按“最后一个点之后的扩展名”去查
+          # noCompress 集合；文件 debian-minirootfs.tar.gz 的末段是 "gz"，
+          # 而原集合只写了 "tar.gz"，导致它仍对该近 GB 资产做 zstd 全量压缩、
+          # 撑爆 JVM 堆 (Java heap space)。把 "gz" 也加进去即可让其跳过压缩。
+          BUILD_GRADLE = os.path.join(REPO, "src/android/app/build.gradle.kts")
+          replace_once(
+              BUILD_GRADLE,
+              'noCompress += listOf("tar.gz", "proot-aarch64")',
+              'noCompress += listOf("tar.gz", "gz", "proot-aarch64")',
+              'noCompress: 加入 "gz" 防止 CompressAssetsWorkAction 全量压缩 rootfs')
+
           print("\n== Done. ==")
           PY_EOF
           python3 /tmp/apply_patches.py .
@@ -243,6 +255,10 @@ jobs:
           # stageDebugSkillAssets 任务要求 .claude/skills/debug-server 目录存在
           # （该目录未提交进 git，原始仓库 CI 会自行创建；gen 脚本对空目录可容忍）
           mkdir -p "$GITHUB_WORKSPACE/.claude/skills/debug-server"
+          # 兜底：加大 Gradle/AGP 堆内存，避免大资产压缩时 OOM
+          if ! grep -q "org.gradle.jvmargs" gradle.properties 2>/dev/null; then
+            echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g" >> gradle.properties
+          fi
           chmod +x ./gradlew
           ./gradlew assembleDebug --no-daemon
 
