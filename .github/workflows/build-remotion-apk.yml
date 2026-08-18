@@ -201,17 +201,14 @@ jobs:
               'log string: Alpine -> Debian')
 
           print("\n[2/2] PRootKernel.kt")
-          # 用不依赖缩进(空格/Tab)的锚点，避免精确匹配因缩进字符不同而失败
-          OLD_BIND = 'cmd.add("/sys")'
-
-          NEW_BIND = '''cmd.add("/sys")
-          // Bind host /dev/shm so headless Chromium / Remotion has shared memory.
-          // Without this, Chrome's renderer/GPU process crashes on launch under PRoot.
-          cmd.add("-b")
-          cmd.add("/dev/shm")'''
-
-          replace_once(PROOT, OLD_BIND, NEW_BIND,
-                       'add -b /dev/shm bind mount')
+          # 重要：这里【不要】给 proot 加 `-b /dev/shm`！
+          # Android 宿主根本没有 /dev/shm（那是 glibc 桌面 Linux 的东西），
+          # 一旦在 proot 命令里写 `-b /dev/shm`，proot 启动时因绑定路径不存在
+          # 直接报错退出，会连带【所有】 shell 执行一起挂掉。
+          # 共享内存改由 default_mount 的 profile.d 在 guest 内部用 tmpfs 挂载，
+          # 不依赖宿主路径。因此这里保持 PRootKernel 原版绑定不变。
+          print("  [SKIP] 保持 PRootKernel 原版绑定 (-b /dev /proc /sys)；")
+          print("         不加 -b /dev/shm（Android 宿主无此路径，会导致 proot 启动失败）")
 
           print("\n[3/3] build.gradle.kts (noCompress 修复)")
           # AGP 的 CompressAssetsWorkAction 按“最后一个点之后的扩展名”去查
@@ -245,6 +242,18 @@ jobs:
           cat > "$DM/etc/profile.d/minis.sh" <<'EOF'
           export PATH="/usr/local/bin:/opt/bin:$PATH"
           export CHROME_HEADLESS=1
+
+          # Chromium / Remotion 需要 /dev/shm 作为共享内存。Android 宿主没有
+          # /dev/shm，所以不能在 proot 里用 `-b /dev/shm` 绑定（会令 proot 启动
+          # 失败、拖垮所有 shell）。此处改为在 sandbox 内部挂载一个 tmpfs 到
+          # /dev/shm。若 proot 禁止挂载则静默跳过——此时请在 Remotion 项目里给
+          # Chromium 加 --disable-dev-shm-usage 兜底。
+          if [ ! -e /dev/shm ]; then
+            mkdir -p /dev/shm 2>/dev/null
+          fi
+          if ! mountpoint -q /dev/shm 2>/dev/null; then
+            mount -t tmpfs -o size=256M,mode=1777 tmpfs /dev/shm 2>/dev/null || true
+          fi
           EOF
 
       - name: 编译 debug APK
