@@ -237,7 +237,12 @@ jobs:
 
       - name: 编译 debug APK
         working-directory: src/android
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
         run: |
+          # stageDebugSkillAssets 任务要求 .claude/skills/debug-server 目录存在
+          # （该目录未提交进 git，原始仓库 CI 会自行创建；gen 脚本对空目录可容忍）
+          mkdir -p "$GITHUB_WORKSPACE/.claude/skills/debug-server"
           chmod +x ./gradlew
           ./gradlew assembleDebug --no-daemon
 
