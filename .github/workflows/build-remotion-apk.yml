@@ -255,10 +255,15 @@ jobs:
           # stageDebugSkillAssets 任务要求 .claude/skills/debug-server 目录存在
           # （该目录未提交进 git，原始仓库 CI 会自行创建；gen 脚本对空目录可容忍）
           mkdir -p "$GITHUB_WORKSPACE/.claude/skills/debug-server"
-          # 兜底：加大 Gradle/AGP 堆内存，避免大资产压缩时 OOM
-          if ! grep -q "org.gradle.jvmargs" gradle.properties 2>/dev/null; then
-            echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g" >> gradle.properties
+          # 强制覆盖 Gradle/AGP 堆内存：OpenMinis 自带的 gradle.properties 里已写
+          # org.gradle.jvmargs=-Xmx2048m，compressDebugAssets 用此小堆处理近 GB 的
+          # rootfs 资产会 Java heap space 失败。先删掉原有行，再写入 -Xmx4g。
+          GRADLE_PROP=gradle.properties
+          if [ -f "$GRADLE_PROP" ]; then
+            grep -v "^org.gradle.jvmargs=" "$GRADLE_PROP" > "$GRADLE_PROP.tmp" || true
+            mv "$GRADLE_PROP.tmp" "$GRADLE_PROP"
           fi
+          printf 'org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8\n' >> "$GRADLE_PROP"
           chmod +x ./gradlew
           ./gradlew assembleDebug --no-daemon
 
