@@ -201,23 +201,12 @@ jobs:
               'log string: Alpine -> Debian')
 
           print("\n[2/2] PRootKernel.kt")
-          OLD_BIND = '''        // Bind essential pseudo-filesystems
-          cmd.add("-b")
-          cmd.add("/dev")
-          cmd.add("-b")
-          cmd.add("/proc")
-          cmd.add("-b")
-          cmd.add("/sys")'''
+          # 用不依赖缩进(空格/Tab)的锚点，避免精确匹配因缩进字符不同而失败
+          OLD_BIND = 'cmd.add("/sys")'
 
-          NEW_BIND = '''        // Bind essential pseudo-filesystems
-          cmd.add("-b")
-          cmd.add("/dev")
-          cmd.add("-b")
-          cmd.add("/proc")
-          cmd.add("-b")
-          cmd.add("/sys")
-
+          NEW_BIND = '''cmd.add("/sys")
           // Bind host /dev/shm so headless Chromium / Remotion has shared memory.
+          // Without this, Chrome's renderer/GPU process crashes on launch under PRoot.
           cmd.add("-b")
           cmd.add("/dev/shm")'''
 
