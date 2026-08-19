@@ -161,42 +161,62 @@ jobs:
           # 仍能运行；先把 /lib64 的加载器恢复，动态命令才恢复可用。
           BB=/usr/bin/busybox
           [ -x "$BB" ] || BB=/bin/busybox
+          [ -x "$BB" ] || { echo "[FATAL] busybox-static 未安装，usrmerge 手术无法进行"; exit 1; }
 
-          # 1) 先把 /lib64 换成真实目录并放入加载器（用静态 busybox，断链也能跑）
-          if [ -L /lib64 ]; then
-            $BB rm -f /lib64
-            $BB mkdir -p /lib64
-          fi
-          $BB cp -aL /usr/lib64/ld-linux-aarch64.so.1 /lib64/ 2>/dev/null \
-            || $BB cp -aL /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 /lib64/
-          # 此刻 /lib64/ld-linux-aarch64.so.1 已是真实文件，动态加载器恢复可用
+          # 1) 移除任何 merged-usr 符号链接（已是真实目录则无操作）。
+          #    注意：必须先用【静态】busybox 执行删/建/拷——因为删掉 /lib64 后，
+          #    所有动态二进制（mkdir/cp 等）的加载器路径即断裂，只有静态二进制能活。
+          for _d in /bin /sbin /lib /lib64; do
+            [ -L "$_d" ] && $BB rm -f "$_d"
+          done
+          # 2) 确保真实目录一定存在（不依赖“它原来是不是符号链接”——之前
+          #    /lib64 仅在“是符号链接”时才 mkdir，若它本来不存在就会 cp 失败丢加载器）。
+          $BB mkdir -p /bin /sbin /lib /lib64 /lib/aarch64-linux-gnu
 
-          # 2) /lib 换成真实目录（删除不影响加载器，可放心用静态 busybox）
-          if [ -L /lib ]; then
-            $BB rm -f /lib
-            $BB mkdir -p /lib /lib/aarch64-linux-gnu
+          # 3) 恢复动态加载器。arm64 真实路径是 /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1；
+          #    /usr/lib64 在 arm64 上通常【不存在】，故以 aarch64-linux-gnu 为主，/usr/lib64 仅兜底。
+          LOADER=""
+          for _c in /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 /usr/lib64/ld-linux-aarch64.so.1; do
+            [ -e "$_c" ] && LOADER="$_c" && break
+          done
+          if [ -z "$LOADER" ]; then
+            echo "[FATAL] 找不到动态链接器 ld-linux-aarch64.so.1，无法完成 usrmerge 手术"
+            exit 1
           fi
-          $BB cp -aL /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 /lib/ 2>/dev/null || true
-          $BB cp -aL /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 /lib/aarch64-linux-gnu/ 2>/dev/null || true
-          # 核心 glibc 运行库做成真实文件（dash 及多数程序启动所必需）
+          for _dst in /lib64 /lib /lib/aarch64-linux-gnu; do
+            $BB cp -aL "$LOADER" "$_dst/" 2>/dev/null || true
+          done
+
+          # 4) 核心 glibc 运行库做成真实文件（dash 及多数程序启动所必需）
           for _l in libc.so.6 libdl.so.2 libm.so.6 libpthread.so.0 librt.so.1 libgcc_s.so.1 libresolv.so.2; do
             $BB cp -aL /usr/lib/aarch64-linux-gnu/$_l /lib/aarch64-linux-gnu/ 2>/dev/null || true
           done
 
-          # 3) /bin 换成真实目录并放入 sh
-          if [ -L /bin ]; then
-            $BB rm -f /bin
-            $BB mkdir -p /bin
-          fi
+          # 5) /bin/sh 做成真实文件（dash；-L 解引用，避免复制成符号链接）
           $BB cp -aL /usr/bin/sh /bin/sh 2>/dev/null || true
 
-          echo "[PHASE] 去 usrmerge 校验:"; ls -l /bin/sh /lib64/ld-linux-aarch64.so.1 /lib/aarch64-linux-gnu/libc.so.6 2>&1
+          # 6) 校验：加载器与 /bin/sh 必须是真实文件（非符号链接），否则 proot 必崩
+          echo "[PHASE] 去 usrmerge 校验:"
+          ls -l /bin/sh /lib64/ld-linux-aarch64.so.1 /lib/aarch64-linux-gnu/libc.so.6 2>&1
+          if [ ! -f /lib64/ld-linux-aarch64.so.1 ] || [ ! -f /bin/sh ]; then
+            echo "[FATAL] usrmerge 校验失败：/lib64/ld-linux-aarch64.so.1 或 /bin/sh 缺失，rootfs 不可用"
+            exit 1
+          fi
           INNER_EOF
 
           docker rm -f remotion-rootfs >/dev/null 2>&1 || true
+          # 把容器内脚本的完整输出落盘到 /tmp/rootfs_build.log（同时 tee 到控制台保持可见）。
+          # 若构建失败，下一个 step 会把它作为产物上传，你直接下载发我即可，无需复制粘贴长日志。
+          set +e
           docker run --name remotion-rootfs --platform linux/arm64 \
             -v /tmp/rootfs_inner.sh:/rootfs_inner.sh \
-            "$DOCKER_IMG" bash /rootfs_inner.sh
+            "$DOCKER_IMG" bash /rootfs_inner.sh 2>&1 | tee /tmp/rootfs_build.log
+          ROOTFS_RC=${PIPESTATUS[0]}
+          set -e
+          if [ "${ROOTFS_RC:-0}" -ne 0 ]; then
+            echo "[ERROR] rootfs 容器内脚本退出码=$ROOTFS_RC，详见 /tmp/rootfs_build.log"
+            exit "$ROOTFS_RC"
+          fi
           log "导出容器文件系统为 rootfs tarball (docker export，避免容器内 tar 打活 FS 的致命错误)..."
           # 选压缩器：优先 pigz（并行、更快），否则 gzip；若宿主机俩都没装，现场 apt 装 gzip。
           # 这正是之前 exit 127 的根因——arm64 runner 上 gzip 没预装，docker export | gzip
@@ -223,6 +243,14 @@ jobs:
           sudo /tmp/prepare_debian_rootfs_android.sh bookworm
           mkdir -p src/android/app/src/main/assets
           cp debian-minirootfs.tar.gz src/android/app/src/main/assets/
+
+      - name: 上传 rootfs 构建日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-build-log
+          path: /tmp/rootfs_build.log
+          if-no-files-found: warn
 
       - name: 使用系统自带 JDK 17（兼容 arm64 / x64 runner）
         run: |
@@ -251,8 +279,13 @@ jobs:
           } >> "$GITHUB_ENV"
           export PATH="$SDK/cmdline-tools/latest/bin:$PATH"
           yes | sdkmanager --licenses
-          sdkmanager --install "ndk;28.0.12433566" "build-tools;34.0.0" "platforms;android-34" "cmake;3.22.1" || \
-          sdkmanager --install "ndk;28.0.13004108" "build-tools;34.0.0" "platforms;android-34" "cmake;3.22.1"
+          # 注意：app/build.gradle.kts 里 compileSdk = 36，因此必须装 android-36 平台
+          # 与配套 build-tools；若只装 android-34 会在 Gradle 配置阶段直接报
+          # "Failed to find Platform SDK with path: android-36" 而失败。
+          # build-tools 按 36 -> 35 -> 34 顺序回退，避免某个精确版本号在镜像里不存在。
+          sdkmanager --install "ndk;28.0.12433566" "build-tools;36.0.0" "platforms;android-36" "cmake;3.22.1" || \
+          sdkmanager --install "ndk;28.0.13004108" "build-tools;35.0.0" "platforms;android-36" "cmake;3.22.1" || \
+          sdkmanager --install "ndk;28.0.12433566" "build-tools;34.0.0" "platforms;android-36" "cmake;3.22.1"
           yes | sdkmanager --licenses
           NDK=$(ls -d "$SDK"/ndk/* 2>/dev/null | sort -V | tail -1)
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
