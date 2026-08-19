@@ -93,7 +93,7 @@ jobs:
           docker run --name remotion-rootfs --platform linux/arm64 \
             -e SUITE="$SUITE" \
             "$DOCKER_IMG" bash -c '
-            set -e
+            set -ex
             export DEBIAN_FRONTEND=noninteractive
             # 容器内禁止 postinst 启动任何系统服务（systemd/dbus 等），避免
             # “System has not been booted with systemd” 类非致命报错中止 apt 安装。
@@ -110,11 +110,11 @@ jobs:
             apt-get update -qq
             echo "[PHASE] 基础工具"
             apt-get install -y -qq --no-install-recommends ca-certificates curl wget gnupg lsb-release xz-utils git python3 make g++ pkg-config bash busybox coreutils util-linux procps
-            echo "[PHASE] Node.js 20"
-            curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-            apt-get install -y -qq --no-install-recommends nodejs
+            echo "[PHASE] Node.js (Debian 自带 nodejs 18 即可满足 Remotion；尝试 nodesource 取 20，失败回退)"
+            curl -fsSL https://deb.nodesource.com/setup_20.x | bash - || echo "[WARN] nodesource 不可用，回退 Debian 自带 nodejs"
+            apt-get install -y -qq --no-install-recommends nodejs npm
             node --version
-            npm --version
+            npm --version || true
             echo "[PHASE] Chromium + 运行库"
             # 某些包（如 systemd/dbus/libpam-systemd，被 chromium 间接依赖拉入）在
             # 容器内 postinst 可能因无 systemd/init 而报错，导致整条 apt 失败、set -e
