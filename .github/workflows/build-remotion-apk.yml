@@ -105,6 +105,10 @@ jobs:
           chmod +x /usr/sbin/policy-rc.d
 
           S="bookworm"
+          # Debian 12 默认用 deb822 格式 /etc/apt/sources.list.d/debian.sources，
+          # 若保留它会和我们写的 /etc/apt/sources.list 重复（报 configured multiple times）。
+          # 先删掉默认 deb822 源文件，只保留我们自己写的那份，避免重复与潜在解析异常。
+          rm -f /etc/apt/sources.list.d/*.sources
           printf 'deb http://deb.debian.org/debian %s main contrib non-free\ndeb http://deb.debian.org/debian %s-updates main contrib non-free\ndeb http://deb.debian.org/debian-security %s-security main\n' "$S" "$S" "$S" > /etc/apt/sources.list
           echo openminis > /etc/hostname
           printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf
@@ -113,10 +117,12 @@ jobs:
           apt-get update -qq || apt-get update -qq || true
 
           echo "[PHASE] 基础工具"
-          # 注意：必须装 busybox-static（静态链接二进制，不依赖动态加载器）。
+          # 注意：只装 busybox-static（静态链接二进制，不依赖动态加载器）。
           # 去 usrmerge 时会先删掉 /lib64 符号链接，导致动态加载器短暂失效，
           # 此刻普通 mkdir/cp 都跑不起来；只有静态 busybox 能在断链状态下执行删/建/拷。
-          apt-get install -y -qq --no-install-recommends ca-certificates curl wget gnupg lsb-release xz-utils git python3 make g++ pkg-config bash busybox busybox-static coreutils util-linux procps
+          # 切勿同时装 busybox 与 busybox-static——二者在 Debian 里互相冲突
+          # （抢占 /bin/busybox），一起装会触发 "held broken packages" 直接失败。
+          apt-get install -y -qq --no-install-recommends ca-certificates curl wget gnupg lsb-release xz-utils git python3 make g++ pkg-config bash busybox-static coreutils util-linux procps
 
           echo "[PHASE] Node.js (nodesource 20，失败回退 Debian 自带)"
           curl -fsSL https://deb.nodesource.com/setup_20.x | bash - || echo "[WARN] nodesource 不可用，回退 Debian 自带 nodejs"
