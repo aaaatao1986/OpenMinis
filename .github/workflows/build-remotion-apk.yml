@@ -95,6 +95,10 @@ jobs:
             "$DOCKER_IMG" bash -c '
             set -e
             export DEBIAN_FRONTEND=noninteractive
+            # 容器内禁止 postinst 启动任何系统服务（systemd/dbus 等），避免
+            # “System has not been booted with systemd” 类非致命报错中止 apt 安装。
+            printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+            chmod +x /usr/sbin/policy-rc.d
             S="$SUITE"
             echo "[PHASE] 写 apt 源 ($S)"
             printf "deb http://deb.debian.org/debian %s main contrib non-free\ndeb http://deb.debian.org/debian %s-updates main contrib non-free\ndeb http://deb.debian.org/debian-security %s-security main\n" "$S" "$S" "$S" > /etc/apt/sources.list
@@ -110,7 +114,18 @@ jobs:
             node --version
             npm --version
             echo "[PHASE] Chromium + 运行库"
-            apt-get install -y -qq --no-install-recommends chromium libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 libpango-1.0-0 libcairo2 libatspi2.0-0 fonts-liberation fonts-noto-core
+            # 某些包（如 systemd/dbus/libpam-systemd，被 chromium 间接依赖拉入）在
+            # 容器内 postinst 可能因无 systemd/init 而报错，导致整条 apt 失败、set -e
+            # 中止构建（run #28 即卡在此类非致命 postinst）。这里做“失败 ->
+            # dpkg --configure -a -> 重试”兜底，避免非致命 postinst 把构建卡死；
+            # 同时 --fix-missing 容忍个别包索引暂不可达。
+            CHROMIUM_PKGS="chromium libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 libpango-1.0-0 libcairo2 libatspi2.0-0 fonts-liberation fonts-noto-core"
+            if ! apt-get install -y -qq --no-install-recommends --fix-missing $CHROMIUM_PKGS; then
+              echo "[WARN] chromium 首次安装失败（可能是某 postinst 非致命报错），尝试修复依赖后重试..."
+              dpkg --configure -a || true
+              apt-get install -y -qq --no-install-recommends --fix-missing $CHROMIUM_PKGS
+            fi
+            echo "[PHASE] Chromium 安装完成"
             chromium --version || true
             echo "[PHASE] 清理 apt 缓存"
             rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* 2>/dev/null || true
