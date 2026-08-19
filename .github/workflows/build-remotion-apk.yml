@@ -113,7 +113,10 @@ jobs:
           apt-get update -qq || apt-get update -qq || true
 
           echo "[PHASE] 基础工具"
-          apt-get install -y -qq --no-install-recommends ca-certificates curl wget gnupg lsb-release xz-utils git python3 make g++ pkg-config bash busybox coreutils util-linux procps
+          # 注意：必须装 busybox-static（静态链接二进制，不依赖动态加载器）。
+          # 去 usrmerge 时会先删掉 /lib64 符号链接，导致动态加载器短暂失效，
+          # 此刻普通 mkdir/cp 都跑不起来；只有静态 busybox 能在断链状态下执行删/建/拷。
+          apt-get install -y -qq --no-install-recommends ca-certificates curl wget gnupg lsb-release xz-utils git python3 make g++ pkg-config bash busybox busybox-static coreutils util-linux procps
 
           echo "[PHASE] Node.js (nodesource 20，失败回退 Debian 自带)"
           curl -fsSL https://deb.nodesource.com/setup_20.x | bash - || echo "[WARN] nodesource 不可用，回退 Debian 自带 nodejs"
@@ -138,29 +141,50 @@ jobs:
           rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* 2>/dev/null || true
 
           echo "[PHASE] 去 usrmerge（关键修复）"
-          # Debian 12 里 /bin /sbin /lib /lib64 都是指向 usr/* 的符号链接。
-          # OpenMinis 的 extractTar() 在 Android 上创建符号链接失败时会静默跳过，
-          # 导致 /bin 与 /lib 直接缺失 -> proot 跑 /bin/sh 时 No such file /
-          # 找不到 glibc 加载器 -> 持久 shell 进程秒退 -> [Shell not running]。
-          # 这里把符号链接删掉、改用真实目录+真实文件，确保解压后 /bin/sh 与
-          # /lib/ld-linux 一定存在（仅补启动 shell 必需文件，不复制全部 usr/*）。
-          # 注意：必须先 rm 符号链接再 mkdir，否则 mkdir -p 会写成空操作、
-          # cp 会穿过符号链接写回 usr/*，跳过重试时仍缺 /bin/sh。
-          for _d in /bin /sbin /lib /lib64; do
-            [ -L "$_d" ] && rm -f "$_d"
-          done
-          mkdir -p /bin /sbin /lib /lib64 /lib/aarch64-linux-gnu
-          # /bin/sh 做成真实文件（dash；-L 解引用，避免复制成符号链接）
-          cp -aL /usr/bin/sh /bin/sh 2>/dev/null || true
-          # 动态链接器（arm64 加载器）做成真实文件
-          cp -aL /usr/lib/ld-linux-aarch64.so.1 /lib/ld-linux-aarch64.so.1 2>/dev/null || true
-          cp -aL /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 /lib/aarch64-linux-gnu/ 2>/dev/null || true
-          cp -aL /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 /lib64/ 2>/dev/null || true
-          # 核心 glibc 运行库（dash 及多数程序启动所必需）做成真实文件
+          # Debian 12 里 /bin /sbin /lib /lib64 是指向 usr/* 的符号链接。
+          # OpenMinis 的 extractTar() 在 Android 上创建符号链接失败会静默跳过，
+          # 导致 /bin、/lib、/lib64 直接缺失 -> proot 跑 /bin/sh 时找不到加载器 ->
+          # 持久 shell 进程秒退 -> [Shell not running]。
+          # 这里把它们换成真实目录+真实文件，确保解压后 /bin/sh 与加载器一定存在。
+          #
+          # 死锁警告：所有动态二进制（mkdir/cp/sh…）的加载器路径是
+          # /lib64/ld-linux-aarch64.so.1；/lib64 当前是符号链接。一旦 rm 掉 /lib64，
+          # 加载器路径即断裂，后续 mkdir/cp 自己都跑不起来（cannot execute:
+          # required file not found，这正是上一次 exit 127 的真因）。
+          # 因此必须用【静态链接】的 busybox-static 执行删/建/拷，它在加载器缺失时
+          # 仍能运行；先把 /lib64 的加载器恢复，动态命令才恢复可用。
+          BB=/usr/bin/busybox
+          [ -x "$BB" ] || BB=/bin/busybox
+
+          # 1) 先把 /lib64 换成真实目录并放入加载器（用静态 busybox，断链也能跑）
+          if [ -L /lib64 ]; then
+            $BB rm -f /lib64
+            $BB mkdir -p /lib64
+          fi
+          $BB cp -aL /usr/lib64/ld-linux-aarch64.so.1 /lib64/ 2>/dev/null \
+            || $BB cp -aL /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 /lib64/
+          # 此刻 /lib64/ld-linux-aarch64.so.1 已是真实文件，动态加载器恢复可用
+
+          # 2) /lib 换成真实目录（删除不影响加载器，可放心用静态 busybox）
+          if [ -L /lib ]; then
+            $BB rm -f /lib
+            $BB mkdir -p /lib /lib/aarch64-linux-gnu
+          fi
+          $BB cp -aL /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 /lib/ 2>/dev/null || true
+          $BB cp -aL /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 /lib/aarch64-linux-gnu/ 2>/dev/null || true
+          # 核心 glibc 运行库做成真实文件（dash 及多数程序启动所必需）
           for _l in libc.so.6 libdl.so.2 libm.so.6 libpthread.so.0 librt.so.1 libgcc_s.so.1 libresolv.so.2; do
-            cp -aL /usr/lib/aarch64-linux-gnu/$_l /lib/aarch64-linux-gnu/ 2>/dev/null || true
+            $BB cp -aL /usr/lib/aarch64-linux-gnu/$_l /lib/aarch64-linux-gnu/ 2>/dev/null || true
           done
-          echo "[PHASE] 去 usrmerge 校验:"; ls -l /bin/sh /lib/ld-linux-aarch64.so.1 /lib/aarch64-linux-gnu/libc.so.6 2>&1
+
+          # 3) /bin 换成真实目录并放入 sh
+          if [ -L /bin ]; then
+            $BB rm -f /bin
+            $BB mkdir -p /bin
+          fi
+          $BB cp -aL /usr/bin/sh /bin/sh 2>/dev/null || true
+
+          echo "[PHASE] 去 usrmerge 校验:"; ls -l /bin/sh /lib64/ld-linux-aarch64.so.1 /lib/aarch64-linux-gnu/libc.so.6 2>&1
           INNER_EOF
 
           docker rm -f remotion-rootfs >/dev/null 2>&1 || true
