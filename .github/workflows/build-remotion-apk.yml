@@ -97,12 +97,9 @@ jobs:
             export DEBIAN_FRONTEND=noninteractive
             # 容器内禁止 postinst 启动任何系统服务（systemd/dbus 等），避免
             # “System has not been booted with systemd” 类非致命报错中止 apt 安装。
-            # 注意：这里必须用【无单引号】的 heredoc 写法，因为整段内嵌在
-            # `bash -c '...'` 的单引号字符串里，任何单引号都会提前闭合它。
-            cat > /usr/sbin/policy-rc.d <<RCD_EOF
-#!/bin/sh
-exit 101
-RCD_EOF
+            # 用【双引号】（不是单引号）：单引号会提前闭合外层 bash -c 的单引号串，
+            # 且整段内嵌在 YAML 的 run:| 多行块里，heredoc 内容行会破坏缩进导致语法错。
+            printf "#!/bin/sh\nexit 101\n" > /usr/sbin/policy-rc.d
             chmod +x /usr/sbin/policy-rc.d
             S="$SUITE"
             echo "[PHASE] 写 apt 源 ($S)"
