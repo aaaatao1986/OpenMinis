@@ -98,6 +98,31 @@ jobs:
             chromium --version || true
             echo "[PHASE] 清理 apt 缓存"
             rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* 2>/dev/null || true
+
+            echo "[PHASE] 去 usrmerge（关键修复）"
+            # Debian 12 里 /bin /sbin /lib /lib64 都是指向 usr/* 的符号链接。
+            # OpenMinis 的 extractTar() 在 Android 上创建符号链接失败时会静默跳过，
+            # 导致 /bin 与 /lib 直接缺失 -> proot 跑 /bin/sh 时 No such file /
+            # 找不到 glibc 加载器 -> 持久 shell 进程秒退 -> [Shell not running]。
+            # 这里把符号链接删掉、改用真实目录+真实文件，确保解压后 /bin/sh 与
+            # /lib/ld-linux 一定存在（仅补启动 shell 必需文件，不复制全部 usr/*）。
+            # 注意：必须先 rm 符号链接再 mkdir，否则 mkdir -p 会写成空操作、
+            # cp 会穿过符号链接写回 usr/*，跳过重试时仍缺 /bin/sh。
+            for _d in /bin /sbin /lib /lib64; do
+              [ -L "$_d" ] && rm -f "$_d"
+            done
+            mkdir -p /bin /sbin /lib /lib64 /lib/aarch64-linux-gnu
+            # /bin/sh 做成真实文件（dash；-L 解引用，避免复制成符号链接）
+            cp -aL /usr/bin/sh /bin/sh 2>/dev/null || true
+            # 动态链接器（arm64 加载器）做成真实文件
+            cp -aL /usr/lib/ld-linux-aarch64.so.1 /lib/ld-linux-aarch64.so.1 2>/dev/null || true
+            cp -aL /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 /lib/aarch64-linux-gnu/ 2>/dev/null || true
+            cp -aL /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 /lib64/ 2>/dev/null || true
+            # 核心 glibc 运行库（dash 及多数程序启动所必需）做成真实文件
+            for _l in libc.so.6 libdl.so.2 libm.so.6 libpthread.so.0 librt.so.1 libgcc_s.so.1 libresolv.so.2; do
+              cp -aL /usr/lib/aarch64-linux-gnu/$_l /lib/aarch64-linux-gnu/ 2>/dev/null || true
+            done
+            echo "[PHASE] 去 usrmerge 校验:"; ls -l /bin/sh /lib/ld-linux-aarch64.so.1 /lib/aarch64-linux-gnu/libc.so.6 2>&1
           '
           log "导出容器文件系统为 rootfs tarball (docker export，避免容器内 tar 打活 FS 的致命错误)..."
           docker export remotion-rootfs | gzip -c > "$OUT_DIR/debian-minirootfs.tar.gz"
