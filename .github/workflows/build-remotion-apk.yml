@@ -65,18 +65,28 @@ jobs:
             exit 1
           fi
 
-          log "注册 qemu-aarch64 binfmt（让 docker 能运行 arm64 容器）..."
-          set +e
-          docker run --privileged --rm tonistiigi/binfmt:latest --install aarch64 2>&1 | tail -5
-          RC1=$?
-          docker run --privileged --rm multiarch/qemu-user-static --reset -p yes 2>&1 | tail -5
-          RC2=$?
-          set -e
-          if [ "${RC1:-1}" -ne 0 ] && [ "${RC2:-1}" -ne 0 ]; then
-            err "binfmt 注册失败（两个镜像都拉不到）。arm64 容器将无法运行。"
-            exit 1
+          # binfmt/qemu 仅用于【x86 宿主模拟 arm64 容器】。在原生 arm64 runner
+          # (ubuntu-24.04-arm) 上 docker 直接原生跑 arm64 容器，根本不需要它；而且
+          # tonistiigi/binfmt / multiarch/qemu-user-static 这两个镜像在受限网络下常拉取
+          # 失败，原脚本会因此 exit 1、把整步在 ~1 分钟内干掉（这正是 run #27 的快速失败）。
+          # 故：原生 arm64 直接跳过；非 arm64 才注册，且注册失败也只告警、不中断构建。
+          HOST_ARCH="$(uname -m)"
+          if [ "$HOST_ARCH" = "aarch64" ] || [ "$HOST_ARCH" = "arm64" ]; then
+            log "宿主机是 $HOST_ARCH：容器原生运行，跳过 qemu binfmt 注册。"
+          else
+            log "注册 qemu-aarch64 binfmt（让 docker 能运行 arm64 容器）..."
+            set +e
+            docker run --privileged --rm tonistiigi/binfmt:latest --install aarch64 2>&1 | tail -5
+            RC1=$?
+            docker run --privileged --rm multiarch/qemu-user-static --reset -p yes 2>&1 | tail -5
+            RC2=$?
+            set -e
+            if [ "${RC1:-1}" -ne 0 ] && [ "${RC2:-1}" -ne 0 ]; then
+              err "binfmt 注册失败（两个镜像都拉不到）。arm64 容器将依赖宿主原生能力；若宿主非 arm64，后续 docker run 会失败。"
+            else
+              log "binfmt 注册完成。"
+            fi
           fi
-          log "binfmt 注册完成。"
 
           log "在 arm64 容器内安装 Node20 + Chromium..."
           docker rm -f remotion-rootfs >/dev/null 2>&1 || true
