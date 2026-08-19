@@ -26,18 +26,18 @@ jobs:
         with:
           submodules: 'recursive'
 
-      - name: 安装宿主机工具 (curl, unzip 等)
+      - name: 安装宿主机工具 (curl, unzip, gzip, pigz 等)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq curl unzip xz-utils ca-certificates pigz || \
-          sudo apt-get install -y -qq curl unzip xz-utils ca-certificates gzip
+          sudo apt-get install -y -qq curl unzip xz-utils ca-certificates gzip pigz || \
+          sudo apt-get install -y -qq curl unzip xz-utils ca-certificates gzip pigz
 
       # ===== 构建 Debian(glibc) rootfs（脚本在运行时生成，不依赖外部文件）=====
       - name: 构建 Debian(glibc) rootfs
         run: |
           cat > /tmp/prepare_debian_rootfs_android.sh <<'PREP_EOF'
           #!/bin/bash
-          set -euo pipefail
+          set -euxo pipefail
           trap 'echo "[ERROR] command failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
           SUITE="${1:-bookworm}"
@@ -131,7 +131,15 @@ jobs:
             echo "[PHASE] 去 usrmerge 校验:"; ls -l /bin/sh /lib/ld-linux-aarch64.so.1 /lib/aarch64-linux-gnu/libc.so.6 2>&1
           '
           log "导出容器文件系统为 rootfs tarball (docker export，避免容器内 tar 打活 FS 的致命错误)..."
-          docker export remotion-rootfs | gzip -c > "$OUT_DIR/debian-minirootfs.tar.gz"
+          # 注意：压缩必须用 pigz/gzip，且这俩必须在【宿主机工具】那一步装好。
+          # ubuntu-24.04-arm 原生 runner 上若没装 gzip，docker export | gzip 会
+          # 报 "gzip: command not found" -> 管道退出 127 -> 整个 step 失败。
+          # 优先用 pigz 并行压缩（更快），没有再退回 gzip。
+          if command -v pigz >/dev/null 2>&1; then
+            docker export remotion-rootfs | pigz -c -p "$(nproc)" > "$OUT_DIR/debian-minirootfs.tar.gz"
+          else
+            docker export remotion-rootfs | gzip -c > "$OUT_DIR/debian-minirootfs.tar.gz"
+          fi
           docker rm -f remotion-rootfs >/dev/null 2>&1 || true
           log "rootfs 已生成: $OUT_DIR/$OUT_TARBALL ($(du -h "$OUT_DIR/$OUT_TARBALL" | cut -f1))"
           PREP_EOF
