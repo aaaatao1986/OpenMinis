@@ -131,11 +131,20 @@ jobs:
             echo "[PHASE] 去 usrmerge 校验:"; ls -l /bin/sh /lib/ld-linux-aarch64.so.1 /lib/aarch64-linux-gnu/libc.so.6 2>&1
           '
           log "导出容器文件系统为 rootfs tarball (docker export，避免容器内 tar 打活 FS 的致命错误)..."
-          # 注意：压缩必须用 pigz/gzip，且这俩必须在【宿主机工具】那一步装好。
-          # ubuntu-24.04-arm 原生 runner 上若没装 gzip，docker export | gzip 会
-          # 报 "gzip: command not found" -> 管道退出 127 -> 整个 step 失败。
-          # 优先用 pigz 并行压缩（更快），没有再退回 gzip。
-          if command -v pigz >/dev/null 2>&1; then
+          # 选压缩器：优先 pigz（并行、更快），否则 gzip；若宿主机俩都没装，现场 apt 装 gzip。
+          # 这正是之前 exit 127 的根因——arm64 runner 上 gzip 没预装，docker export | gzip
+          # 报 "gzip: command not found" -> 管道退出 127 -> 整个 step 失败。这里做兜底，
+          # 保证无论宿主机有没有压缩器都不会再 127。
+          COMP=""
+          command -v pigz >/dev/null 2>&1 && COMP=pigz
+          [ -z "$COMP" ] && command -v gzip >/dev/null 2>&1 && COMP=gzip
+          if [ -z "$COMP" ]; then
+            log "宿主机缺压缩器，现场安装 gzip..."
+            sudo apt-get update -qq && sudo apt-get install -y -qq gzip
+            COMP=gzip
+          fi
+          log "导出 rootfs（压缩器=$COMP）..."
+          if [ "$COMP" = pigz ]; then
             docker export remotion-rootfs | pigz -c -p "$(nproc)" > "$OUT_DIR/debian-minirootfs.tar.gz"
           else
             docker export remotion-rootfs | gzip -c > "$OUT_DIR/debian-minirootfs.tar.gz"
@@ -145,6 +154,7 @@ jobs:
           PREP_EOF
           chmod +x /tmp/prepare_debian_rootfs_android.sh
           sudo /tmp/prepare_debian_rootfs_android.sh bookworm
+          mkdir -p src/android/app/src/main/assets
           cp debian-minirootfs.tar.gz src/android/app/src/main/assets/
 
       - name: 使用系统自带 JDK 17（兼容 arm64 / x64 runner）
