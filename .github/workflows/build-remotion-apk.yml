@@ -89,74 +89,84 @@ jobs:
           fi
 
           log "在 arm64 容器内安装 Node20 + Chromium..."
+
+          # 把容器内脚本写成【独立文件】，再用 docker run -v 挂载执行，
+          # 彻底绕开 bash -c '...' 的引号地狱；文件内 set -ex 的跟踪会直接出现在日志里，
+          # 下次再炸能一眼看到容器内哪一行出错（之前 100/127 都因 bash -c 吞掉了内部 trace）。
+          # 注意：外层用 <<'INNER_EOF'（单引号）包裹，故内层单/双引号、$(...) 都不会被外层展开。
+          cat > /tmp/rootfs_inner.sh <<'INNER_EOF'
+          #!/bin/bash
+          set -ex
+          export DEBIAN_FRONTEND=noninteractive
+
+          # 禁止 postinst 启动任何系统服务（systemd/dbus 等），避免
+          # "System has not been booted with systemd" 类非致命报错中止 apt 安装。
+          printf "#!/bin/sh\nexit 101\n" > /usr/sbin/policy-rc.d
+          chmod +x /usr/sbin/policy-rc.d
+
+          S="bookworm"
+          printf 'deb http://deb.debian.org/debian %s main contrib non-free\ndeb http://deb.debian.org/debian %s-updates main contrib non-free\ndeb http://deb.debian.org/debian-security %s-security main\n' "$S" "$S" "$S" > /etc/apt/sources.list
+          echo openminis > /etc/hostname
+          printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf
+
+          echo "[PHASE] apt update"
+          apt-get update -qq || apt-get update -qq || true
+
+          echo "[PHASE] 基础工具"
+          apt-get install -y -qq --no-install-recommends ca-certificates curl wget gnupg lsb-release xz-utils git python3 make g++ pkg-config bash busybox coreutils util-linux procps
+
+          echo "[PHASE] Node.js (nodesource 20，失败回退 Debian 自带)"
+          curl -fsSL https://deb.nodesource.com/setup_20.x | bash - || echo "[WARN] nodesource 不可用，回退 Debian 自带 nodejs"
+          apt-get install -y -qq --no-install-recommends nodejs npm || true
+          node --version || true
+          npm --version || true
+
+          echo "[PHASE] Chromium（只装 chromium，让 apt 自动解析依赖；不手列库名，避免某个库名解析失败返回 100）"
+          # 首次失败 -> 修复依赖并重试；仍失败则打印明确 [FATAL] 后退出 1，
+          # 不再返回难以定位的 100。
+          if ! apt-get install -y -qq --no-install-recommends chromium fonts-liberation; then
+            echo "[WARN] chromium 首次安装失败，尝试修复依赖后重试..."
+            dpkg --configure -a || true
+            apt-get install -y -qq --fix-broken || true
+            apt-get install -y -qq --no-install-recommends chromium fonts-liberation \
+              || { echo "[FATAL] chromium 安装最终失败，详见上方 apt 错误"; exit 1; }
+          fi
+          echo "[PHASE] Chromium 安装完成"
+          chromium --version || true
+
+          echo "[PHASE] 清理 apt 缓存"
+          rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* 2>/dev/null || true
+
+          echo "[PHASE] 去 usrmerge（关键修复）"
+          # Debian 12 里 /bin /sbin /lib /lib64 都是指向 usr/* 的符号链接。
+          # OpenMinis 的 extractTar() 在 Android 上创建符号链接失败时会静默跳过，
+          # 导致 /bin 与 /lib 直接缺失 -> proot 跑 /bin/sh 时 No such file /
+          # 找不到 glibc 加载器 -> 持久 shell 进程秒退 -> [Shell not running]。
+          # 这里把符号链接删掉、改用真实目录+真实文件，确保解压后 /bin/sh 与
+          # /lib/ld-linux 一定存在（仅补启动 shell 必需文件，不复制全部 usr/*）。
+          # 注意：必须先 rm 符号链接再 mkdir，否则 mkdir -p 会写成空操作、
+          # cp 会穿过符号链接写回 usr/*，跳过重试时仍缺 /bin/sh。
+          for _d in /bin /sbin /lib /lib64; do
+            [ -L "$_d" ] && rm -f "$_d"
+          done
+          mkdir -p /bin /sbin /lib /lib64 /lib/aarch64-linux-gnu
+          # /bin/sh 做成真实文件（dash；-L 解引用，避免复制成符号链接）
+          cp -aL /usr/bin/sh /bin/sh 2>/dev/null || true
+          # 动态链接器（arm64 加载器）做成真实文件
+          cp -aL /usr/lib/ld-linux-aarch64.so.1 /lib/ld-linux-aarch64.so.1 2>/dev/null || true
+          cp -aL /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 /lib/aarch64-linux-gnu/ 2>/dev/null || true
+          cp -aL /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 /lib64/ 2>/dev/null || true
+          # 核心 glibc 运行库（dash 及多数程序启动所必需）做成真实文件
+          for _l in libc.so.6 libdl.so.2 libm.so.6 libpthread.so.0 librt.so.1 libgcc_s.so.1 libresolv.so.2; do
+            cp -aL /usr/lib/aarch64-linux-gnu/$_l /lib/aarch64-linux-gnu/ 2>/dev/null || true
+          done
+          echo "[PHASE] 去 usrmerge 校验:"; ls -l /bin/sh /lib/ld-linux-aarch64.so.1 /lib/aarch64-linux-gnu/libc.so.6 2>&1
+          INNER_EOF
+
           docker rm -f remotion-rootfs >/dev/null 2>&1 || true
           docker run --name remotion-rootfs --platform linux/arm64 \
-            -e SUITE="$SUITE" \
-            "$DOCKER_IMG" bash -c '
-            set -ex
-            export DEBIAN_FRONTEND=noninteractive
-            # 容器内禁止 postinst 启动任何系统服务（systemd/dbus 等），避免
-            # “System has not been booted with systemd” 类非致命报错中止 apt 安装。
-            # 用【双引号】（不是单引号）：单引号会提前闭合外层 bash -c 的单引号串，
-            # 且整段内嵌在 YAML 的 run:| 多行块里，heredoc 内容行会破坏缩进导致语法错。
-            printf "#!/bin/sh\nexit 101\n" > /usr/sbin/policy-rc.d
-            chmod +x /usr/sbin/policy-rc.d
-            S="$SUITE"
-            echo "[PHASE] 写 apt 源 ($S)"
-            printf "deb http://deb.debian.org/debian %s main contrib non-free\ndeb http://deb.debian.org/debian %s-updates main contrib non-free\ndeb http://deb.debian.org/debian-security %s-security main\n" "$S" "$S" "$S" > /etc/apt/sources.list
-            echo openminis > /etc/hostname
-            printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf
-            echo "[PHASE] apt update"
-            apt-get update -qq
-            echo "[PHASE] 基础工具"
-            apt-get install -y -qq --no-install-recommends ca-certificates curl wget gnupg lsb-release xz-utils git python3 make g++ pkg-config bash busybox coreutils util-linux procps
-            echo "[PHASE] Node.js (Debian 自带 nodejs 18 即可满足 Remotion；尝试 nodesource 取 20，失败回退)"
-            curl -fsSL https://deb.nodesource.com/setup_20.x | bash - || echo "[WARN] nodesource 不可用，回退 Debian 自带 nodejs"
-            apt-get install -y -qq --no-install-recommends nodejs npm
-            node --version
-            npm --version || true
-            echo "[PHASE] Chromium + 运行库"
-            # 某些包（如 systemd/dbus/libpam-systemd，被 chromium 间接依赖拉入）在
-            # 容器内 postinst 可能因无 systemd/init 而报错，导致整条 apt 失败、set -e
-            # 中止构建（run #28 即卡在此类非致命 postinst）。这里做“失败 ->
-            # dpkg --configure -a -> 重试”兜底，避免非致命 postinst 把构建卡死；
-            # 同时 --fix-missing 容忍个别包索引暂不可达。
-            CHROMIUM_PKGS="chromium libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 libpango-1.0-0 libcairo2 libatspi2.0-0 fonts-liberation fonts-noto-core"
-            if ! apt-get install -y -qq --no-install-recommends --fix-missing $CHROMIUM_PKGS; then
-              echo "[WARN] chromium 首次安装失败（可能是某 postinst 非致命报错），尝试修复依赖后重试..."
-              dpkg --configure -a || true
-              apt-get install -y -qq --no-install-recommends --fix-missing $CHROMIUM_PKGS
-            fi
-            echo "[PHASE] Chromium 安装完成"
-            chromium --version || true
-            echo "[PHASE] 清理 apt 缓存"
-            rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* 2>/dev/null || true
-
-            echo "[PHASE] 去 usrmerge（关键修复）"
-            # Debian 12 里 /bin /sbin /lib /lib64 都是指向 usr/* 的符号链接。
-            # OpenMinis 的 extractTar() 在 Android 上创建符号链接失败时会静默跳过，
-            # 导致 /bin 与 /lib 直接缺失 -> proot 跑 /bin/sh 时 No such file /
-            # 找不到 glibc 加载器 -> 持久 shell 进程秒退 -> [Shell not running]。
-            # 这里把符号链接删掉、改用真实目录+真实文件，确保解压后 /bin/sh 与
-            # /lib/ld-linux 一定存在（仅补启动 shell 必需文件，不复制全部 usr/*）。
-            # 注意：必须先 rm 符号链接再 mkdir，否则 mkdir -p 会写成空操作、
-            # cp 会穿过符号链接写回 usr/*，跳过重试时仍缺 /bin/sh。
-            for _d in /bin /sbin /lib /lib64; do
-              [ -L "$_d" ] && rm -f "$_d"
-            done
-            mkdir -p /bin /sbin /lib /lib64 /lib/aarch64-linux-gnu
-            # /bin/sh 做成真实文件（dash；-L 解引用，避免复制成符号链接）
-            cp -aL /usr/bin/sh /bin/sh 2>/dev/null || true
-            # 动态链接器（arm64 加载器）做成真实文件
-            cp -aL /usr/lib/ld-linux-aarch64.so.1 /lib/ld-linux-aarch64.so.1 2>/dev/null || true
-            cp -aL /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 /lib/aarch64-linux-gnu/ 2>/dev/null || true
-            cp -aL /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 /lib64/ 2>/dev/null || true
-            # 核心 glibc 运行库（dash 及多数程序启动所必需）做成真实文件
-            for _l in libc.so.6 libdl.so.2 libm.so.6 libpthread.so.0 librt.so.1 libgcc_s.so.1 libresolv.so.2; do
-              cp -aL /usr/lib/aarch64-linux-gnu/$_l /lib/aarch64-linux-gnu/ 2>/dev/null || true
-            done
-            echo "[PHASE] 去 usrmerge 校验:"; ls -l /bin/sh /lib/ld-linux-aarch64.so.1 /lib/aarch64-linux-gnu/libc.so.6 2>&1
-          '
+            -v /tmp/rootfs_inner.sh:/rootfs_inner.sh \
+            "$DOCKER_IMG" bash /rootfs_inner.sh
           log "导出容器文件系统为 rootfs tarball (docker export，避免容器内 tar 打活 FS 的致命错误)..."
           # 选压缩器：优先 pigz（并行、更快），否则 gzip；若宿主机俩都没装，现场 apt 装 gzip。
           # 这正是之前 exit 127 的根因——arm64 runner 上 gzip 没预装，docker export | gzip
