@@ -87,7 +87,7 @@ jobs:
             echo "[PHASE] apt update"
             apt-get update -qq
             echo "[PHASE] 基础工具"
-            apt-get install -y -qq --no-install-recommends ca-certificates curl wget gnupg lsb-release xz-utils git python3 make g++ pkg-config
+            apt-get install -y -qq --no-install-recommends ca-certificates curl wget gnupg lsb-release xz-utils git python3 make g++ pkg-config bash busybox coreutils util-linux procps
             echo "[PHASE] Node.js 20"
             curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
             apt-get install -y -qq --no-install-recommends nodejs
